@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -42,16 +43,16 @@ type Hook struct {
 	keployServerPort *ebpf.Map
 
 	platform.TestCaseDB
+
 	logger        *zap.Logger
-	proxyPortList []uint32
+	proxyPort     uint32
 	tcsMocks      []*models.Mock
 	configMocks   []*models.Mock
-	path          string
 	mu            *sync.Mutex
 	mutex         sync.RWMutex
 	userAppCmd    *exec.Cmd
 	mainRoutineId int
-
+  
 	// ebpf objects and events
 	stopper  chan os.Signal
 	socket   link.Link
@@ -90,7 +91,7 @@ type Hook struct {
 	idc clients.InternalDockerClient
 }
 
-func NewHook(path string, db platform.TestCaseDB, mainRoutineId int, logger *zap.Logger) *Hook {
+func NewHook(db platform.TestCaseDB, mainRoutineId int, logger *zap.Logger) *Hook {
 	idc, err := docker.NewInternalDockerClient(logger)
 	if err != nil {
 		logger.Fatal("failed to create internal docker client", zap.Error(err))
@@ -100,11 +101,18 @@ func NewHook(path string, db platform.TestCaseDB, mainRoutineId int, logger *zap
 		// db:          db,
 		TestCaseDB:    db,
 		mu:            &sync.Mutex{},
-		path:          path,
 		userIpAddress: make(chan string),
 		idc:           idc,
 		mainRoutineId: mainRoutineId,
 	}
+}
+
+func (h *Hook) SetProxyPort(port uint32) {
+	h.proxyPort = port
+}
+
+func (h *Hook) GetProxyPort() uint32 {
+	return h.proxyPort
 }
 
 func (h *Hook) GetDepsSize() int {
@@ -118,7 +126,7 @@ func (h *Hook) AppendMocks(m *models.Mock) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	// h.tcsMocks = append(h.tcsMocks, m)
-	err := h.TestCaseDB.WriteMock(h.path, m)
+	err := h.TestCaseDB.WriteMock(m)
 	if err != nil {
 		return err
 	}
@@ -284,16 +292,53 @@ func (h *Hook) SetKeployModeInKernel(mode uint32) {
 		h.logger.Error("failed to set keploy mode in the epbf program", zap.Any("error thrown by ebpf map", err.Error()))
 	}
 }
+func (h *Hook) killProcessesAndTheirChildren(parentPID int) {
+
+	pids := []int{}
+
+	h.findAndCollectChildProcesses(fmt.Sprintf("%d", parentPID), &pids)
+
+	for _, childPID := range pids {
+		err := syscall.Kill(childPID, syscall.SIGKILL)
+		if err != nil {
+			h.logger.Error("failed to set kill child pid", zap.Any("error killing child process", err.Error()))
+		}
+	}
+}
+
+func (h *Hook) findAndCollectChildProcesses(parentPID string, pids *[]int) {
+
+	cmd := exec.Command("pgrep", "-P", parentPID)
+	parentIDint, err := strconv.Atoi(parentPID)
+	if err != nil {
+		h.logger.Error("failed to convert parent PID to int", zap.Any("error converting parent PID to int", err.Error()))
+	}
+
+	*pids = append(*pids, parentIDint)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return
+	}
+
+	outputStr := string(output)
+	childPIDs := strings.Split(outputStr, "\n")
+	childPIDs = childPIDs[:len(childPIDs)-1]
+
+	for _, childPID := range childPIDs {
+		if childPID != "" {
+			h.findAndCollectChildProcesses(childPID, pids)
+		}
+	}
+}
 
 // StopUserApplication stops the user application
 func (h *Hook) StopUserApplication() {
 	if h.userAppCmd != nil && h.userAppCmd.Process != nil {
-		err := h.userAppCmd.Process.Kill()
-		if err != nil {
-			h.logger.Error("failed to stop user application", zap.Error(err))
-		} else {
-			h.logger.Info("User application stopped successfully...")
+		if h.userAppCmd.ProcessState != nil && h.userAppCmd.ProcessState.Exited() {
+			return
 		}
+		h.killProcessesAndTheirChildren(h.userAppCmd.Process.Pid)
 	}
 }
 
@@ -312,6 +357,8 @@ func (h *Hook) Recover(id int) {
 func (h *Hook) Stop(forceStop bool) {
 	if !forceStop {
 		<-h.stopper
+		// stop the user application cmd
+		h.StopUserApplication()
 		h.logger.Info("Received signal, exiting program..")
 
 	} else {
@@ -331,9 +378,6 @@ func (h *Hook) Stop(forceStop bool) {
 			// log.Fatalf("closing ringbuf reader: %s", err)
 		}
 	}
-
-	// stop the user application cmd
-	h.StopUserApplication()
 
 	// closing all events
 	//other
@@ -419,7 +463,7 @@ func (h *Hook) LoadHooks(appCmd, appContainer string, pid uint32) error {
 		defer h.Recover(pkg.GenerateRandomID())
 
 		for {
-			connectionFactory.HandleReadyConnections(h.path, h.TestCaseDB)
+			connectionFactory.HandleReadyConnections(h.TestCaseDB)
 			time.Sleep(1 * time.Second)
 		}
 	}()

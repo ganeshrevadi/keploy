@@ -20,9 +20,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"go.keploy.io/server/pkg"
 	"go.keploy.io/server/pkg/proxy/integrations/grpcparser"
+	postgresparser "go.keploy.io/server/pkg/proxy/integrations/postgresParser"
 
 	"github.com/cloudflare/cfssl/csr"
 	cfsslLog "github.com/cloudflare/cfssl/log"
@@ -37,7 +39,6 @@ import (
 	genericparser "go.keploy.io/server/pkg/proxy/integrations/genericParser"
 	"go.keploy.io/server/pkg/proxy/integrations/httpparser"
 	"go.keploy.io/server/pkg/proxy/integrations/mongoparser"
-	postgresparser "go.keploy.io/server/pkg/proxy/integrations/postgresParser"
 	"go.keploy.io/server/pkg/proxy/util"
 	"go.uber.org/zap"
 
@@ -45,6 +46,13 @@ import (
 )
 
 var Emoji = "\U0001F430" + " Keploy:"
+
+// idCounter is used to generate random ID for each request
+var idCounter int64 = -1
+
+func getNextID() int64 {
+	return atomic.AddInt64(&idCounter, 1)
+}
 
 type ProxySet struct {
 	IP4              uint32
@@ -143,6 +151,23 @@ var caFolder embed.FS
 func isJavaInstalled() bool {
 	_, err := exec.LookPath("java")
 	return err == nil
+}
+
+// to extract ca certificate to temp
+func ExtractCertToTemp() (string, error) {
+	tempFile, err := ioutil.TempFile("", "ca.crt")
+	if err != nil {
+		return "", err
+	}
+	defer tempFile.Close()
+
+	// Change the file permissions to allow read access for all users
+	err = os.Chmod(tempFile.Name(), 0666)
+	if err != nil {
+		return "", err
+	}
+
+	return tempFile.Name(), nil
 }
 
 // JavaCAExists checks if the CA is already installed in the specified Java keystore
@@ -248,6 +273,8 @@ func InstallJavaCA(logger *zap.Logger, caPath string, pid uint32, isJavaServe bo
 
 		logger.Info("Java detected and successfully imported CA", zap.String("path", cacertsPath), zap.String("output", string(cmdOutput)))
 		logger.Info("Successfully imported CA", zap.Any("", cmdOutput))
+	} else {
+		logger.Debug("Java is not installed on the system")
 	}
 }
 
@@ -289,6 +316,16 @@ func BootProxy(logger *zap.Logger, opt Option, appCmd, appContainer string, pid 
 
 	// Update the trusted CAs store
 	cmd := exec.Command("/usr/bin/sudo", caStoreUpdateCmd[distro])
+
+	tempCertPath, err := ExtractCertToTemp()
+	if err != nil {
+		logger.Error(Emoji+"Failed to extract certificate to tmp folder: %v", zap.Any("failed to extract certificate", err))
+	}
+
+	err = os.Setenv("NODE_EXTRA_CA_CERTS", tempCertPath)
+	if err != nil {
+		logger.Error(Emoji+"Failed to set environment variable NODE_EXTRA_CA_CERTS: %v", zap.Any("failed to certificate path in environment", err))
+	}
 	// log.Printf("This is the command2: %v", cmd)
 	err = cmd.Run()
 	if err != nil {
@@ -569,27 +606,25 @@ func (ps *ProxySet) startProxy() {
 	}
 }
 
-func readableProxyAddress(ps *ProxySet) string {
+// func readableProxyAddress(ps *ProxySet) string {
 
-	if ps != nil {
-		port := ps.Port
-		proxyAddress := util.ToIP4AddressStr(ps.IP4)
-		return fmt.Sprintf(proxyAddress+":%v", port)
-	}
-	return ""
-}
+// 	if ps != nil {
+// 		port := ps.Port
+// 		proxyAddress := util.ToIP4AddressStr(ps.IP4)
+// 		return fmt.Sprintf(proxyAddress+":%v", port)
+// 	}
+// 	return ""
+// }
 
 func (ps *ProxySet) startDnsServer() {
 
-	proxyAddress4 := readableProxyAddress(ps)
-	ps.logger.Debug("", zap.Any("ProxyAddress in dns server", proxyAddress4))
-
+	dnsServerAddr := fmt.Sprintf(":%v", ps.Port)
 	//TODO: Need to make it configurable
 	ps.DnsServerTimeout = 1 * time.Second
 
 	handler := ps
 	server := &dns.Server{
-		Addr:      proxyAddress4,
+		Addr:      dnsServerAddr,
 		Net:       "udp",
 		Handler:   handler,
 		UDPSize:   65535,
@@ -599,7 +634,7 @@ func (ps *ProxySet) startDnsServer() {
 
 	ps.DnsServer = server
 
-	ps.logger.Info(fmt.Sprintf("starting DNS server at addr:%v", server.Addr))
+	ps.logger.Info(fmt.Sprintf("starting DNS server at addr %v", server.Addr))
 	err := server.ListenAndServe()
 	if err != nil {
 		ps.logger.Error("failed to start dns server", zap.Any("addr", server.Addr), zap.Error(err))
@@ -745,12 +780,12 @@ func (ps *ProxySet) handleTLSConnection(conn net.Conn) (net.Conn, error) {
 	caPrivKey, err = helpers.ParsePrivateKeyPEM(caPKey)
 	if err != nil {
 		ps.logger.Error(Emoji+"Failed to parse CA private key: ", zap.Error(err))
-		return &dns.Transfer{}, err
+		return nil, err
 	}
 	caCertParsed, err = helpers.ParseCertificatePEM(caCrt)
 	if err != nil {
 		ps.logger.Error(Emoji+"Failed to parse CA certificate: ", zap.Error(err))
-		return &dns.Transfer{}, err
+		return nil, err
 	}
 
 	// Create a TLS configuration
@@ -771,7 +806,7 @@ func (ps *ProxySet) handleTLSConnection(conn net.Conn) (net.Conn, error) {
 
 	if err != nil {
 		ps.logger.Error(Emoji+"failed to complete TLS handshake with the client with error: ", zap.Error(err))
-		return &dns.Transfer{}, err
+		return nil, err
 	}
 	// fmt.Println("after the parsed req: ", string(req))
 	// Perform the TLS handshake
@@ -849,7 +884,7 @@ func (ps *ProxySet) handleConnection(conn net.Conn, port uint32) {
 	}
 	connEstablishedAt := time.Now()
 	rand.Seed(time.Now().UnixNano())
-	clientConnId := rand.Intn(101)
+	clientConnId := getNextID()
 
 	// attempt to read the conn until buffer is either filled or connection is closed
 	var buffer []byte
@@ -889,9 +924,8 @@ func (ps *ProxySet) handleConnection(conn net.Conn, port uint32) {
 	}
 
 	//Dialing for tls connection
-	destConnId := 0
 	// if models.GetMode() != models.MODE_TEST {
-	destConnId = rand.Intn(101)
+	destConnId := getNextID()
 	logger := ps.logger.With(zap.Any("Client IP Address", conn.RemoteAddr().String()), zap.Any("Client ConnectionID", clientConnId), zap.Any("Destination IP Address", actualAddress), zap.Any("Destination ConnectionID", destConnId))
 	if isTLS {
 		logger.Debug("", zap.Any("isTLS", isTLS))
@@ -944,33 +978,16 @@ func (ps *ProxySet) handleConnection(conn net.Conn, port uint32) {
 		// fmt.Println("before mongo egress call, deps array: ", deps)
 		logger.Debug("into mongo parsing mode")
 		mongoparser.ProcessOutgoingMongo(clientConnId, destConnId, buffer, conn, dst, ps.hook, connEstablishedAt, readRequestDelay, logger)
-		// fmt.Println("after mongo egress call, deps array: ", deps)
 
-		// ps.hook.SetDeps(deps)
-
-		// deps := mongoparser.CaptureMongoMessage(buffer, conn, dst, logger)
-		// for _, v := range deps {
-		// 	ps.hook.AppendDeps(v)
-		// }
 	case postgresparser.IsOutgoingPSQL(buffer):
 
 		logger.Debug("into psql desp mode, before passing")
-
 		postgresparser.ProcessOutgoingPSQL(buffer, conn, dst, ps.hook, logger)
 	case grpcparser.IsOutgoingGRPC(buffer):
 		grpcparser.ProcessOutgoingGRPC(buffer, conn, dst, ps.hook, logger)
 	default:
 		logger.Debug("the external dependecy call is not supported")
 		genericparser.ProcessGeneric(buffer, conn, dst, ps.hook, logger)
-		// fmt.Println("into default desp mode, before passing")
-		// err = callNext(buffer, conn, dst, logger)
-		// if err != nil {
-		// 	logger.Error("failed to call next", zap.Error(err))
-		// 	conn.Close()
-		// 	return
-		// }
-		// fmt.Println("into default desp mode, after passing")
-
 	}
 
 	// Closing the user client connection
